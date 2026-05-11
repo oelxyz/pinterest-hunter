@@ -82,9 +82,18 @@ HEADERS = {
 
 # Backlink checker APIs (free tiers / open endpoints)
 BACKLINK_SOURCES = {
-    "commoncrawl": "https://index.commoncrawl.org/CC-MAIN-2024-10-index?url={domain}&output=json&limit=5",
-    "wayback":     "https://web.archive.org/cdx/search/cdx?url={url}&output=json&limit=5&fl=original,timestamp",
+    "wayback": "https://web.archive.org/cdx/search/cdx?url={url}&output=json&limit=10&fl=original,timestamp,statuscode&collapse=urlkey",
 }
+
+# CommonCrawl indexes to check — dari terbaru ke terlama
+# Setiap index = satu snapshot crawl web (~2 bulan sekali)
+CC_INDEXES = [
+    "CC-MAIN-2024-10",   # Feb/Mar 2024
+    "CC-MAIN-2023-50",   # Des 2023
+    "CC-MAIN-2023-23",   # Jun 2023
+    "CC-MAIN-2022-49",   # Des 2022
+    "CC-MAIN-2021-43",   # Okt 2021
+]
 
 
 # ─────────────────────────────────────────────
@@ -330,12 +339,14 @@ async def check_backlinks(
 ) -> dict:
     """
     Check multiple sources for backlinks pointing to pinterest.com/<username>.
-    Returns a dict with source → list of backlink records.
+    - Wayback Machine CDX (semua tahun)
+    - CommonCrawl: 5 index dari 2021–2024
+    Returns a dict dengan source → list of backlink records.
     """
     profile_url = f"pinterest.com/{username}"
     backlinks = {}
 
-    # 1. Wayback Machine (CDX API)
+    # ── 1. Wayback Machine (CDX API) ──────────────────────────────────────
     wayback_url = (
         f"https://web.archive.org/cdx/search/cdx"
         f"?url={quote(profile_url)}*&output=json&limit=10"
@@ -348,7 +359,6 @@ async def check_backlinks(
         ) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
-                # First row is header
                 rows = data[1:] if data and len(data) > 1 else []
                 backlinks["wayback"] = [
                     {"original": r[0], "timestamp": r[1], "status": r[2]}
@@ -360,34 +370,57 @@ async def check_backlinks(
         backlinks["wayback"] = []
         backlinks["wayback_error"] = str(e)
 
-    # 2. CommonCrawl Index (latest available)
-    cc_url = (
-        f"https://index.commoncrawl.org/CC-MAIN-2024-10-index"
-        f"?url={quote('pinterest.com/' + username)}*&output=json&limit=10"
-    )
-    try:
-        async with session.get(
-            cc_url,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                records = []
-                for line in text.strip().splitlines():
-                    try:
-                        records.append(json.loads(line))
-                    except Exception:
-                        pass
-                backlinks["commoncrawl"] = records[:10]
-            else:
-                backlinks["commoncrawl"] = []
-    except Exception as e:
-        backlinks["commoncrawl"] = []
-        backlinks["commoncrawl_error"] = str(e)
+    # ── 2. CommonCrawl — cek semua index sekaligus (parallel) ────────────
+    encoded_url = quote(f"pinterest.com/{username}") + "*"
 
-    # 3. Bing search scrape via CDX approach – count mentions
-    #    (No API key needed – uses Bing XML sitemap trick)
-    #    We'll just count total refs found
+    async def fetch_cc_index(index_name: str) -> list:
+        cc_url = (
+            f"https://index.commoncrawl.org/{index_name}-index"
+            f"?url={encoded_url}&output=json&limit=5"
+        )
+        try:
+            async with session.get(
+                cc_url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    records = []
+                    for line in text.strip().splitlines():
+                        try:
+                            rec = json.loads(line)
+                            rec["_index"] = index_name   # tandai dari index mana
+                            records.append(rec)
+                        except Exception:
+                            pass
+                    return records
+        except Exception:
+            pass
+        return []
+
+    # Jalankan semua CC index secara paralel
+    cc_results = await asyncio.gather(*[fetch_cc_index(idx) for idx in CC_INDEXES])
+
+    # Gabungkan semua hasil, deduplicate berdasarkan URL
+    seen_urls = set()
+    all_cc_records = []
+    for idx_name, records in zip(CC_INDEXES, cc_results):
+        for rec in records:
+            url_key = rec.get("url", "")
+            if url_key not in seen_urls:
+                seen_urls.add(url_key)
+                all_cc_records.append(rec)
+
+    backlinks["commoncrawl"] = all_cc_records[:20]  # max 20 unik
+
+    # Per-index breakdown (untuk info detail)
+    backlinks["commoncrawl_by_index"] = {
+        idx: len(records)
+        for idx, records in zip(CC_INDEXES, cc_results)
+        if records
+    }
+
+    # ── 3. Hitung total ───────────────────────────────────────────────────
     total_refs = (
         len(backlinks.get("wayback", []))
         + len(backlinks.get("commoncrawl", []))
@@ -409,22 +442,43 @@ async def estimate_value(username: str, backlink_data: dict) -> dict:
     score = 0
     reasons = []
 
-    wb = len(backlink_data.get("wayback", []))
-    cc = len(backlink_data.get("commoncrawl", []))
+    wb    = len(backlink_data.get("wayback", []))
+    cc    = len(backlink_data.get("commoncrawl", []))
     total = wb + cc
+    # Jumlah index CC yang menemukan data (makin banyak index = makin tua backlink-nya)
+    cc_index_hits = len(backlink_data.get("commoncrawl_by_index", {}))
 
     if total > 0:
-        score += min(total * 10, 50)
-        reasons.append(f"{total} backlink records found")
+        score += min(total * 5, 40)   # max 40 poin dari jumlah backlink
+        reasons.append(f"{total} backlink records found (WB:{wb} CC:{cc})")
+
+    # Bonus jika muncul di banyak CC index — artinya backlink sudah lama & stabil
+    if cc_index_hits >= 4:
+        score += 20
+        reasons.append(f"ditemukan di {cc_index_hits}/5 CC index (backlink stabil)")
+    elif cc_index_hits >= 2:
+        score += 10
+        reasons.append(f"ditemukan di {cc_index_hits}/5 CC index")
+
+    # Wayback bonus — banyak snapshot = akun pernah sangat aktif
+    if wb >= 8:
+        score += 15
+        reasons.append(f"{wb} Wayback snapshots (sangat aktif)")
+    elif wb >= 4:
+        score += 8
+        reasons.append(f"{wb} Wayback snapshots")
 
     # Short usernames are more valuable
     ulen = len(username)
-    if ulen <= 6:
+    if ulen <= 5:
         score += 20
-        reasons.append("short username (≤6 chars)")
-    elif ulen <= 10:
-        score += 10
-        reasons.append("medium username (≤10 chars)")
+        reasons.append("short username (≤5 chars)")
+    elif ulen <= 8:
+        score += 12
+        reasons.append("short username (≤8 chars)")
+    elif ulen <= 12:
+        score += 5
+        reasons.append("medium username (≤12 chars)")
 
     # Keyword value
     high_value_kw = ["shop", "store", "brand", "official", "fashion", "design",
@@ -434,11 +488,6 @@ async def estimate_value(username: str, backlink_data: dict) -> dict:
             score += 15
             reasons.append(f"high-value keyword '{kw}'")
             break
-
-    # Wayback snapshots → more history = more valuable
-    if wb >= 5:
-        score += 15
-        reasons.append(f"{wb} Wayback snapshots")
 
     score = min(score, 100)
 
@@ -571,24 +620,27 @@ def print_summary(results: list[dict], expired: list[dict], stats: dict):
     )
     table.add_column("Rank", style="bold white", justify="right", width=5)
     table.add_column("Username", style="bold yellow", width=20)
-    table.add_column("Pinterest URL", style="cyan", width=40)
+    table.add_column("Pinterest URL", style="cyan", width=38)
     table.add_column("HTTP", justify="center", width=6)
     table.add_column("Backlinks", justify="center", width=10)
+    table.add_column("CC Idx", justify="center", width=7)
     table.add_column("Score", justify="center", width=7)
     table.add_column("Tier", width=12)
-    table.add_column("Sources", width=24)
+    table.add_column("Sources", width=20)
 
     for i, r in enumerate(expired_sorted, 1):
-        bl = r.get("backlinks", {})
+        bl  = r.get("backlinks", {})
         val = r.get("value", {})
-        wb = len(bl.get("wayback", []))
-        cc = len(bl.get("commoncrawl", []))
+        wb  = len(bl.get("wayback", []))
+        cc  = len(bl.get("commoncrawl", []))
+        cc_idx_hits = len(bl.get("commoncrawl_by_index", {}))
         total_bl = bl.get("total_backlinks_found", 0)
         score = val.get("score", 0)
-        tier = val.get("tier", "")
+        tier  = val.get("tier", "")
         sources = f"WB:{wb} CC:{cc}"
 
         score_style = "green" if score >= 70 else ("yellow" if score >= 40 else "dim")
+        cc_idx_style = "green" if cc_idx_hits >= 4 else ("yellow" if cc_idx_hits >= 2 else "dim")
 
         table.add_row(
             str(i),
@@ -596,6 +648,7 @@ def print_summary(results: list[dict], expired: list[dict], stats: dict):
             r["url"],
             str(r["http_code"]),
             str(total_bl),
+            f"[{cc_idx_style}]{cc_idx_hits}/5[/{cc_idx_style}]",
             f"[{score_style}]{score}[/{score_style}]",
             tier,
             sources,
@@ -619,6 +672,7 @@ def save_results(results: list[dict], expired: list[dict], output_file: str):
 
     fieldnames = ["username", "url", "http_code", "status", "note",
                   "backlinks_total", "wayback_count", "commoncrawl_count",
+                  "cc_indexes_hit", "cc_index_breakdown",
                   "score", "tier", "reasons", "checked_at"]
     # Strip emoji from tier for clean CSV output
     def clean(s: str) -> str:
@@ -628,24 +682,27 @@ def save_results(results: list[dict], expired: list[dict], output_file: str):
         writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         for r in sorted(expired, key=lambda x: x.get("value", {}).get("score", 0), reverse=True):
-            bl = r.get("backlinks", {})
+            bl  = r.get("backlinks", {})
             val = r.get("value", {})
             tier_raw = val.get("tier", "")
-            # Tier label without emoji
             tier_plain = tier_raw.split(" ", 1)[-1] if " " in tier_raw else tier_raw
+            cc_by_index   = bl.get("commoncrawl_by_index", {})
+            cc_breakdown  = " | ".join(f"{k}:{v}" for k, v in cc_by_index.items())
             writer.writerow({
-                "username": r["username"],
-                "url": r["url"],
-                "http_code": r["http_code"],
-                "status": r["status"],
-                "note": clean(r.get("note", "")),
-                "backlinks_total": bl.get("total_backlinks_found", 0),
-                "wayback_count": len(bl.get("wayback", [])),
-                "commoncrawl_count": len(bl.get("commoncrawl", [])),
-                "score": val.get("score", 0),
-                "tier": tier_plain,
-                "reasons": "; ".join(val.get("reasons", [])),
-                "checked_at": r.get("checked_at", ""),
+                "username":           r["username"],
+                "url":                r["url"],
+                "http_code":          r["http_code"],
+                "status":             r["status"],
+                "note":               clean(r.get("note", "")),
+                "backlinks_total":    bl.get("total_backlinks_found", 0),
+                "wayback_count":      len(bl.get("wayback", [])),
+                "commoncrawl_count":  len(bl.get("commoncrawl", [])),
+                "cc_indexes_hit":     len(cc_by_index),
+                "cc_index_breakdown": cc_breakdown,
+                "score":              val.get("score", 0),
+                "tier":               tier_plain,
+                "reasons":            "; ".join(val.get("reasons", [])),
+                "checked_at":         r.get("checked_at", ""),
             })
 
     console.print(f"[bold green]✔[/bold green] Full results saved → [cyan]{json_path}[/cyan]")
